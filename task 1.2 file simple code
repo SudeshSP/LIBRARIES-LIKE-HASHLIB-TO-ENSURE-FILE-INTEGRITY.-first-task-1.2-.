@@ -1,239 +1,44 @@
-"""
-File: file_integrity_monitor.py
-Purpose: Simple file integrity tool for Kali Linux (or any Linux).
-Features:
- - Create a baseline of files (+ SHA256 hashes)
- - Scan and verify current files against baseline
- - Continuous monitoring (polling) to detect new/changed/deleted files
- - Exclude patterns, recursion, logging
-
-Usage examples (see README text below or run -h):
-  python3 file_integrity_monitor.py --init /path/to/watch --baseline baseline.json
-  python3 file_integrity_monitor.py --scan /path/to/watch --baseline baseline.json
-  python3 file_integrity_monitor.py --monitor /path/to/watch --baseline baseline.json --interval 30
-
-Dependencies: Python 3.8+ (uses standard library only: hashlib, json, argparse, logging)
-
-Note: Keep baseline.json in a secure location (read-only when possible).
-"""
-
-import argparse
 import hashlib
-import json
-import logging
-import os
 import sys
-import time
 from pathlib import Path
-from typing import Dict, List, Tuple
 
-# ---------- Configuration ----------
-DEFAULT_HASH = 'sha256'
-LOG_FILE = 'file_integrity_monitor.log'
-# -----------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-
-
-def compute_hash(path: Path, algorithm: str = DEFAULT_HASH, block_size: int = 65536) -> str:
-    """Compute the hash (sha256 by default) for a file in binary mode."""
-    h = hashlib.new(algorithm)
-    try:
-        with path.open('rb') as f:
-            for block in iter(lambda: f.read(block_size), b''):
-                h.update(block)
-    except (PermissionError, IsADirectoryError) as e:
-        logging.warning(f"Could not read {path}: {e}")
-        return ''
+def file_hash(path):
+    """Return SHA-256 hash of the file as a hex string."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
     return h.hexdigest()
 
+def create_baseline(file_list, baseline_file):
+    with open(baseline_file, 'w') as out:
+        for f in file_list:
+            out.write(f"{f}:{file_hash(f)}\n")
 
-def build_file_list(root: Path, recursive: bool = True, exclude: List[str] = None) -> List[Path]:
-    """Return a list of file Paths under root, applying optional excludes."""
-    exclude = exclude or []
-    files = []
-    if not root.exists():
-        logging.error(f"Path does not exist: {root}")
-        return files
-
-    if root.is_file():
-        files.append(root)
-        return files
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        # apply exclude patterns to directories and filenames
-        rel = os.path.relpath(dirpath, start=str(root))
-        if rel == '.':
-            rel = ''
-        skip_dir = False
-        for pat in exclude:
-            if pat and pat in dirpath:
-                skip_dir = True
-                break
-        if skip_dir:
-            continue
-
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            skip = False
-            for pat in exclude:
-                if pat and pat in str(full):
-                    skip = True
-                    break
-            if not skip:
-                files.append(full)
-
-        if not recursive:
-            break
-
-    return files
-
-
-def create_baseline(root: Path, baseline_file: Path, recursive: bool = True, exclude: List[str] = None) -> None:
-    logging.info(f"Creating baseline for: {root}")
-    files = build_file_list(root, recursive, exclude)
-    baseline: Dict[str, Dict] = {}
-    for p in sorted(files):
-        rel = str(p.relative_to(root)) if root.is_dir() else str(p)
-        digest = compute_hash(p)
-        baseline[rel] = {
-            'path': str(p),
-            'hash': digest,
-            'mtime': p.stat().st_mtime if p.exists() else None,
-            'size': p.stat().st_size if p.exists() else None
-        }
-        logging.debug(f"Hashed {rel}: {digest}")
-
-    with baseline_file.open('w') as fh:
-        json.dump({
-            'root': str(root),
-            'algorithm': DEFAULT_HASH,
-            'created': time.time(),
-            'files': baseline
-        }, fh, indent=2)
-
-    logging.info(f"Baseline written to {baseline_file}. Entry count: {len(baseline)}")
-
-
-def load_baseline(baseline_file: Path) -> Tuple[Path, Dict[str, Dict]]:
-    if not baseline_file.exists():
-        logging.error(f"Baseline file not found: {baseline_file}")
-        raise FileNotFoundError(baseline_file)
-    with baseline_file.open('r') as fh:
-        data = json.load(fh)
-    root = Path(data.get('root', '.'))
-    files = data.get('files', {})
-    logging.info(f"Loaded baseline from {baseline_file}. Entries: {len(files)}")
-    return root, files
-
-
-def scan_once(root: Path, baseline_file: Path, recursive: bool = True, exclude: List[str] = None) -> Dict:
-    """Compare current files against baseline; return a dict of changes."""
-    root, baseline = load_baseline(baseline_file)
-    results = {
-        'modified': [],
-        'missing': [],
-        'new': []
-    }
-
-    current_files = build_file_list(Path(root), recursive, exclude)
-    current_rel_map = {str(p.relative_to(root)): p for p in current_files}
-
-    # Check baseline entries
-    for rel, meta in baseline.items():
-        expected_hash = meta.get('hash', '')
-        if rel not in current_rel_map:
-            results['missing'].append(rel)
-            logging.warning(f"MISSING: {rel}")
-            continue
-        p = current_rel_map[rel]
-        current_hash = compute_hash(p)
-        if current_hash != expected_hash:
-            results['modified'].append({'file': rel, 'expected': expected_hash, 'current': current_hash})
-            logging.warning(f"MODIFIED: {rel}")
-
-    # Find new files
-    for rel, p in current_rel_map.items():
-        if rel not in baseline:
-            results['new'].append(rel)
-            logging.info(f"NEW: {rel}")
-
-    return results
-
-
-def monitor(root: Path, baseline_file: Path, interval: int = 60, recursive: bool = True, exclude: List[str] = None) -> None:
-    logging.info(f"Starting monitor for {root} (interval: {interval}s)")
-    try:
-        while True:
-            results = scan_once(root, baseline_file, recursive, exclude)
-            if results['modified'] or results['missing'] or results['new']:
-                logging.info("=== Change detected ===")
-                if results['modified']:
-                    logging.info(f"Modified ({len(results['modified'])}):")
-                    for m in results['modified']:
-                        logging.info(f" - {m['file']}")
-                if results['missing']:
-                    logging.info(f"Missing ({len(results['missing'])}): {results['missing']}")
-                if results['new']:
-                    logging.info(f"New ({len(results['new'])}): {results['new']}")
-                logging.info("=== End report ===")
+def check_integrity(baseline_file):
+    with open(baseline_file) as f:
+        for line in f:
+            fname, expected = line.strip().split(':')
+            current = file_hash(fname)
+            if current == expected:
+                print(f"[OK] {fname}")
             else:
-                logging.debug("No changes detected.")
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        logging.info("Monitor stopped by user")
+                print(f"[CHANGED] {fname}")
 
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage:")
+        print("  python3 file_integrity.py init <files...> <baseline.txt>")
+        print("  python3 file_integrity.py check <baseline.txt>")
+        sys.exit(1)
 
-def parse_args():
-    p = argparse.ArgumentParser(description='File Integrity Monitor using hashlib (SHA256).')
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument('--init', metavar='PATH', help='Create baseline for PATH')
-    group.add_argument('--scan', metavar='PATH', help='Scan once and compare to baseline')
-    group.add_argument('--monitor', metavar='PATH', help='Continuously monitor PATH and report changes')
-    p.add_argument('--baseline', metavar='BASELINE', default='baseline.json', help='Baseline JSON file (default: baseline.json)')
-    p.add_argument('--interval', type=int, default=60, help='Polling interval in seconds for --monitor (default 60)')
-    p.add_argument('--no-recursive', action='store_true', help='Do not recurse into subdirectories')
-    p.add_argument('--exclude', metavar='PATTERN', action='append', help='Path substring to exclude (can be used multiple times)')
-    p.add_argument('--verbose', action='store_true', help='Verbose logging (DEBUG)')
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    baseline_file = Path(args.baseline)
-    recursive = not args.no_recursive
-    excludes = args.exclude or []
-
-    if args.init:
-        root = Path(args.init)
-        create_baseline(root, baseline_file, recursive, excludes)
-        logging.info('Baseline creation complete. Secure baseline file and consider making it read-only.')
-        return
-
-    if args.scan:
-        root = Path(args.scan)
-        results = scan_once(root, baseline_file, recursive, excludes)
-        print('\nScan summary:')
-        print(f" Modified: {len(results['modified'])}")
-        print(f" Missing : {len(results['missing'])}")
-        print(f" New     : {len(results['new'])}")
-        return
-
-    if args.monitor:
-        root = Path(args.monitor)
-        monitor(root, baseline_file, interval=args.interval, recursive=recursive, exclude=excludes)
-        return
-
-
-if __name__ == '__main__':
-    main()
+    mode = sys.argv[1]
+    if mode == "init":
+        *files, baseline = sys.argv[2:]
+        create_baseline(files, baseline)
+        print(f"Baseline saved to {baseline}")
+    elif mode == "check":
+        baseline = sys.argv[2]
+        check_integrity(baseline)
+    else:
+        print("Invalid mode. Use init or check.")
