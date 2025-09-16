@@ -1,1 +1,31 @@
+(nano file_integrity.py) Save this as scripts.
 
+# Make a test directory
+mkdir ~/fi_test
+echo "hello" > ~/fi_test/a.txt
+echo "world" > ~/fi_test/b.txt
+
+# Create baseline
+python3 file_integrity.py init ~/fi_test/a.txt ~/fi_test/b.txt baseline.txt
+# ➜ Baseline saved to baseline.txt
+
+# Verify integrity
+python3 file_integrity.py check baseline.txt
+# ➜ [OK] /home/user/fi_test/a.txt
+# ➜ [OK] /home/user/fi_test/b.txt
+
+echo "tampered" >> ~/fi_test/a.txt
+python3 file_integrity.py check baseline.txt
+# ➜ [CHANGED] /home/user/fi_test/a.txt
+# ➜ [OK] /home/user/fi_test/b.txt
+
+
+Why this works
+
+hashlib.sha256() generates a cryptographic hash of each file.
+
+The baseline file stores the original hashes.
+
+Later, recalculating and comparing the hashes shows if any file has been modified.
+
+That’s all you need for a straightforward, practical file-integrity checker on Kali Linux.
